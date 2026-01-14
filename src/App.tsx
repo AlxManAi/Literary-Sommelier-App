@@ -1,22 +1,25 @@
 
-
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { ChatMessage as ChatMessageType, Step, UserAnswers, BotMessage } from './types.js';
-import { getSommelierResponse, generateImage, generateSpeech, connectToLive } from './services/geminiService.js';
+import { ChatMessage as ChatMessageType, Step, BotMessage, Recommendation } from './types.js';
+import { getSommelierResponse, generateImage, generateSpeech, connectToLive, findBookLink } from './services/geminiService.js';
 import { ChatMessage } from './components/ChatMessage.js';
 import { ChatInput } from './components/ChatInput.js';
-import { ResetIcon, SommelierIcon } from './components/icons.js';
+import { HistoryPanel } from './components/HistoryPanel.js';
+import { ResetIcon, SommelierIcon, SpeakerOnIcon, SpeakerOffIcon, BookmarkIcon } from './components/icons.js';
 import { decode, decodeAudioData, encode } from './utils/audio.js';
 
 const App: React.FC = () => {
     const [step, setStep] = useState<Step>('init');
-    const [userAnswers, setUserAnswers] = useState<UserAnswers>({});
     const [chatHistory, setChatHistory] = useState<ChatMessageType[]>([]);
     const [isLoading, setIsLoading] = useState(false);
     const [isRecording, setIsRecording] = useState(false);
+    const [isMuted, setIsMuted] = useState(false);
+    const [isHistoryPanelOpen, setIsHistoryPanelOpen] = useState(false);
+    const [recommendationHistory, setRecommendationHistory] = useState<Recommendation[]>([]);
     
     const audioContextRef = useRef<AudioContext | null>(null);
-    const liveSessionRef = useRef<any>(null); // Using any for the live session object
+    const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
+    const liveSessionRef = useRef<any>(null);
     const microphoneStreamRef = useRef<MediaStream | null>(null);
     const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
 
@@ -29,6 +32,13 @@ const App: React.FC = () => {
     };
 
     const playAudio = useCallback(async (base64Audio: string) => {
+        if (isMuted) return;
+        
+        if (audioSourceRef.current) {
+            audioSourceRef.current.stop();
+            audioSourceRef.current = null;
+        }
+
         if (!audioContextRef.current) {
             audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
         }
@@ -40,7 +50,8 @@ const App: React.FC = () => {
         source.buffer = audioBuffer;
         source.connect(audioContext.destination);
         source.start();
-    }, []);
+        audioSourceRef.current = source;
+    }, [isMuted]);
 
     const addBotMessage = useCallback(async (text: string, imageUrl: string | null = null) => {
         const botMessage: BotMessage = {
@@ -52,17 +63,18 @@ const App: React.FC = () => {
         };
         setChatHistory(prev => [...prev, botMessage]);
 
-        try {
-            const audioData = await generateSpeech(text);
-            if (audioData) {
-                setChatHistory(prev => prev.map(msg => msg.id === botMessage.id ? { ...msg, audioUrl: audioData } : msg));
-                await playAudio(audioData);
+        if (!isMuted) {
+            try {
+                const audioData = await generateSpeech(text);
+                if (audioData) {
+                    setChatHistory(prev => prev.map(msg => msg.id === botMessage.id ? { ...msg, audioUrl: audioData } : msg));
+                    await playAudio(audioData);
+                }
+            } catch (error) {
+                console.error("Error generating or playing speech:", error);
             }
-        } catch (error) {
-            console.error("Error generating or playing speech:", error);
         }
-    }, [playAudio]);
-
+    }, [playAudio, isMuted]);
 
     const stopRecording = useCallback(() => {
         if (liveSessionRef.current) {
@@ -82,9 +94,14 @@ const App: React.FC = () => {
     }, []);
 
     const handleReset = useCallback(() => {
+        if (audioSourceRef.current) {
+            audioSourceRef.current.stop();
+            audioSourceRef.current = null;
+        }
         setStep('init');
-        setUserAnswers({});
         setChatHistory([initialMessage]);
+        setRecommendationHistory([]);
+        setIsHistoryPanelOpen(false);
         setIsLoading(false);
         if (isRecording) {
             stopRecording();
@@ -93,39 +110,42 @@ const App: React.FC = () => {
 
     useEffect(() => {
         handleReset();
-        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    const processRecommendations = useCallback(async () => {
-        setIsLoading(true);
+    const processRecommendations = useCallback(async (currentChatHistory: ChatMessageType[]) => {
         try {
-            const response = await getSommelierResponse('consult', userAnswers, chatHistory);
+            const response = await getSommelierResponse('consult', currentChatHistory);
             const imagePromptMatch = response.match(/\[описание по настроению: (.*?)\]/);
             const cleanResponse = response.replace(/\[описание по настроению: (.*?)\]/, '').trim();
 
-            await addBotMessage(cleanResponse);
+            const recRegex = /###\s*(.*?) \((.*?)\)/g;
+            let match;
+            const newRecs: Recommendation[] = [];
+            while ((match = recRegex.exec(cleanResponse)) !== null) {
+                newRecs.push({ title: match[1].trim(), author: match[2].trim() });
+            }
 
+            if (newRecs.length > 0) {
+                setRecommendationHistory(prev => [...prev, ...newRecs]);
+            }
+
+            let imageUrl: string | null = null;
             if (imagePromptMatch && imagePromptMatch[1]) {
                 const imagePrompt = imagePromptMatch[1];
                 const imageData = await generateImage(imagePrompt);
                 if (imageData) {
-                     const imageMessage: ChatMessageType = {
-                        id: Date.now() + 1,
-                        sender: 'bot',
-                        text: null,
-                        imageUrl: `data:image/png;base64,${imageData}`
-                    };
-                    setChatHistory(prev => [...prev, imageMessage]);
+                    imageUrl = `data:image/png;base64,${imageData}`;
                 }
             }
+            
+            await addBotMessage(cleanResponse, imageUrl);
             setStep('dialog');
+
         } catch (error) {
             console.error("Error during consultation:", error);
             await addBotMessage("Произошла ошибка при подборе рекомендаций. Попробуйте еще раз.");
-        } finally {
-            setIsLoading(false);
         }
-    }, [addBotMessage, userAnswers, chatHistory]);
+    }, [addBotMessage]);
 
 
     const handleUserInput = useCallback(async (input: string, imageBase64: string | null = null) => {
@@ -142,30 +162,13 @@ const App: React.FC = () => {
         setIsLoading(true);
 
         try {
-            if (step !== 'dialog' && step !== 'consult') {
-                const newAnswers = { ...userAnswers };
-                const answerKeyMap: Record<Step, keyof UserAnswers | null> = { 'init': 'mood', 'q1': 'plot', 'q2': 'genres', 'q3': 'favorites', 'q4': 'other', 'consult': null, 'dialog': null };
-                
-                const answerKey = answerKeyMap[step];
-                if (answerKey) {
-                    (newAnswers as any)[answerKey] = input;
-                }
-                setUserAnswers(newAnswers);
-                
-                const aiResponse = await getSommelierResponse(step, newAnswers, newChatHistory, imageBase64);
+            const aiResponse = await getSommelierResponse(step, newChatHistory, imageBase64);
 
-                if (aiResponse.includes('[PROCEED_TO_CONSULTATION]')) {
-                    setStep('consult');
-                } else {
-                    await addBotMessage(aiResponse);
-                    // FIX: Completed the map to satisfy the Record<Step, Step> type, preventing a TypeScript error.
-                    const nextStepMap: Record<Step, Step> = { 'init': 'q1', 'q1': 'q2', 'q2': 'q3', 'q3': 'q4', 'q4': 'consult', 'consult': 'dialog', 'dialog': 'dialog' };
-                    setStep(nextStepMap[step]);
-                }
-
+            if (aiResponse.includes('[PROCEED_TO_CONSULTATION]')) {
+                setStep('consult');
+                await processRecommendations(newChatHistory);
             } else {
-                 const response = await getSommelierResponse(step, userAnswers, newChatHistory, imageBase64);
-                 await addBotMessage(response);
+                await addBotMessage(aiResponse);
             }
         } catch (error) {
             console.error("Error processing user input:", error);
@@ -173,14 +176,29 @@ const App: React.FC = () => {
         } finally {
             setIsLoading(false);
         }
-    }, [step, userAnswers, addBotMessage, chatHistory]);
-
-    useEffect(() => {
-        if (step === 'consult') {
-            processRecommendations();
-        }
-    }, [step, processRecommendations]);
+    }, [step, chatHistory, addBotMessage, processRecommendations]);
     
+    const handleFindLink = useCallback(async (title: string, author: string) => {
+        setIsLoading(true);
+        setChatHistory(prev => [...prev, {id: Date.now(), sender: 'user', text: `Найди, пожалуйста, ссылку на книгу "${title}".`}]);
+        try {
+            const linkResponse = await findBookLink(title, author);
+            await addBotMessage(linkResponse);
+        } catch (error) {
+            console.error("Error finding book link:", error);
+            await addBotMessage("Не удалось найти ссылку на книгу. Попробуйте еще раз.");
+        } finally {
+            setIsLoading(false);
+        }
+    }, [addBotMessage]);
+
+    const handleCopyText = useCallback((text: string) => {
+        navigator.clipboard.writeText(text).then(() => {
+        }).catch(err => {
+            console.error('Failed to copy text: ', err);
+        });
+    }, []);
+
     const startRecording = useCallback(async () => {
         if (isRecording) {
             stopRecording();
@@ -247,7 +265,6 @@ const App: React.FC = () => {
         }
     }, [isRecording, stopRecording, handleUserInput, addBotMessage]);
 
-
     return (
         <div className="bg-gradient-to-br from-gray-900 via-gray-800 to-black text-white h-screen w-screen flex flex-col font-sans">
             <header className="flex items-center justify-between p-4 border-b border-gray-700 shadow-lg">
@@ -258,18 +275,40 @@ const App: React.FC = () => {
                         <p className="text-sm text-gray-400">Ваш персональный книжный гид</p>
                     </div>
                 </div>
-                <button
-                    onClick={handleReset}
-                    className="p-2 rounded-full hover:bg-gray-700 transition-colors duration-200"
-                    aria-label="Начать диалог с начала"
-                >
-                    <ResetIcon className="w-6 h-6 text-gray-400 hover:text-white"/>
-                </button>
+                <div className="flex items-center space-x-2">
+                    <button
+                        onClick={() => setIsHistoryPanelOpen(true)}
+                        className="p-2 rounded-full hover:bg-gray-700 transition-colors duration-200"
+                        aria-label="История рекомендаций"
+                    >
+                        <BookmarkIcon className="w-6 h-6 text-gray-400 hover:text-white"/>
+                    </button>
+                     <button
+                        onClick={() => setIsMuted(prev => !prev)}
+                        className="p-2 rounded-full hover:bg-gray-700 transition-colors duration-200"
+                        aria-label={isMuted ? "Включить звук" : "Выключить звук"}
+                    >
+                        {isMuted ? <SpeakerOffIcon className="w-6 h-6 text-gray-400 hover:text-white"/> : <SpeakerOnIcon className="w-6 h-6 text-gray-400 hover:text-white"/>}
+                    </button>
+                    <button
+                        onClick={handleReset}
+                        className="p-2 rounded-full hover:bg-gray-700 transition-colors duration-200"
+                        aria-label="Начать диалог с начала"
+                    >
+                        <ResetIcon className="w-6 h-6 text-gray-400 hover:text-white"/>
+                    </button>
+                </div>
             </header>
             
             <main className="flex-1 overflow-y-auto p-4 md:p-6 space-y-6">
                 {chatHistory.map((msg) => (
-                    <ChatMessage key={msg.id} message={msg} onPlayAudio={playAudio} />
+                    <ChatMessage 
+                        key={msg.id} 
+                        message={msg} 
+                        onPlayAudio={playAudio} 
+                        onFindLink={handleFindLink}
+                        onCopyText={handleCopyText}
+                    />
                 ))}
                 {isLoading && (
                     <div className="flex justify-center">
@@ -283,6 +322,12 @@ const App: React.FC = () => {
                 )}
                  <div ref={(el) => el?.scrollIntoView({ behavior: 'smooth' })} />
             </main>
+
+            <HistoryPanel 
+                isOpen={isHistoryPanelOpen} 
+                onClose={() => setIsHistoryPanelOpen(false)} 
+                recommendations={recommendationHistory}
+            />
 
             <footer className="p-4 bg-gray-900/50 backdrop-blur-sm border-t border-gray-700">
                 <ChatInput 

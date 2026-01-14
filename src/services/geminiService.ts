@@ -1,7 +1,6 @@
 
-
 import { GoogleGenAI, GenerateContentResponse, LiveServerMessage, Modality } from '@google/genai';
-import { Step, UserAnswers, ChatMessage } from '../types.js';
+import { Step, ChatMessage } from '../types.js';
 
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
@@ -10,28 +9,29 @@ const imageModel = 'gemini-2.5-flash-image';
 const ttsModel = 'gemini-2.5-flash-preview-tts';
 const liveModel = 'gemini-2.5-flash-native-audio-preview-12-2025';
 
-const constructPrompt = (step: Step, answers: UserAnswers, history?: ChatMessage[], imageBase64?: string | null): any => {
-    const systemInstruction = `Ты — "Литературный Сомелье", эмпатичный и вдохновляющий эксперт по подбору книг. Твои ответы должны быть лаконичными (до 150 слов). Ты строго следуешь рабочему процессу.
+const constructPrompt = (step: Step, history?: ChatMessage[], imageBase64?: string | null): any => {
+    const systemInstruction = `Ты — "Литературный Сомелье", эмпатичный и вдохновляющий эксперт по подбору книг. Твои ответы должны быть лаконичными (до 150 слов). Веди диалог от женского лица (например, "я подобрала", "ваш сомелье").
     
     Workflow:
-    - init: Приветствие и вопрос о настроении.
-    - q1-q4: Диагностика (динамика, жанр, любимое, особенности).
-    - consult: Предоставление 3 рекомендаций на основе ответов.
+    - init: Приветствие и сбор информации (настроение, сюжет, жанр и т.д.).
+    - consult: Предоставление 3 рекомендаций на основе собранной информации.
     - dialog: Обсуждение рекомендаций, ответы на вопросы.
     
-    Current State:
-    - Step: ${step}
-    - User Answers: ${JSON.stringify(answers)}
+    Current Step: ${step}
     `;
 
+    const formattedHistory = history?.map(m => {
+        const role = m.sender === 'user' ? 'Пользователь' : 'Сомелье';
+        return `${role}: ${m.text || '[изображение]'}`;
+    }).join('\n');
+
     if (step === 'consult' && history) {
-        const formattedHistory = history.map(m => `${m.sender === 'user' ? 'Пользователь' : 'Сомелье'}: ${m.text}`).join('\n');
         return {
             model: textModel,
             contents: `Проанализируй весь предыдущий диалог, чтобы понять предпочтения пользователя:\n---\n${formattedHistory}\n---\n
-Теперь, основываясь на всей собранной информации, дай 3 рекомендации книг. 
-Для каждой рекомендации:
-1. Укажи название и автора.
+Теперь, основываясь на всей собранной информации, дай 3 рекомендации книг. Раздели каждую рекомендацию тремя дефисами (---).
+Для каждой рекомендации используй СТРОГИЙ формат:
+1. Начни с '###' и укажи Название книги, а затем в скобках (Автор).
 2. Кратко объясни, почему она подходит, связывая с ответами из диалога.
 3. Добавь интригующий тизер (1-2 предложения).
 Для ПЕРВОЙ книги в списке, добавь в конце описания специальный тег для генерации изображения, который описывает атмосферу книги. Формат: "[описание по настроению: твой текст описания]".`,
@@ -40,25 +40,17 @@ const constructPrompt = (step: Step, answers: UserAnswers, history?: ChatMessage
     }
     
     if (step === 'dialog' && history) {
-        // FIX: Correctly map chat history to include both text and images, ensuring the model has full context.
         const chatHistory = history.map(msg => {
             const parts: any[] = [];
-            if (msg.text !== null && typeof msg.text !== 'undefined') {
-                parts.push({ text: msg.text });
-            }
+            if (msg.text) parts.push({ text: msg.text });
             if (msg.imageUrl) {
-                const mimeType = msg.imageUrl.substring(msg.imageUrl.indexOf(':') + 1, msg.imageUrl.indexOf(';'));
-                const data = msg.imageUrl.substring(msg.imageUrl.indexOf(',') + 1);
-                parts.push({
-                    inlineData: { mimeType, data }
+                 parts.push({
+                    inlineData: {
+                        mimeType: msg.imageUrl.split(';')[0].split(':')[1],
+                        data: msg.imageUrl.split(',')[1],
+                    }
                 });
             }
-
-            // The model requires at least one part.
-            if (parts.length === 0) {
-                parts.push({ text: '' });
-            }
-            
             return {
                 role: msg.sender === 'user' ? 'user' : 'model',
                 parts: parts
@@ -67,11 +59,7 @@ const constructPrompt = (step: Step, answers: UserAnswers, history?: ChatMessage
 
         const lastUserMessage = history[history.length - 1];
         const currentUserContent: any = { role: 'user', parts: [] };
-
-        if (lastUserMessage.text) {
-             currentUserContent.parts.push({ text: lastUserMessage.text });
-        }
-       
+        if (lastUserMessage.text) currentUserContent.parts.push({ text: lastUserMessage.text });
         if (imageBase64) {
             currentUserContent.parts.push({
                 inlineData: {
@@ -79,59 +67,51 @@ const constructPrompt = (step: Step, answers: UserAnswers, history?: ChatMessage
                     data: imageBase64.split(',')[1],
                 }
             });
-            currentUserContent.parts[0].text = currentUserContent.parts[0].text 
-                ? `${currentUserContent.parts[0].text} (Посмотри на это изображение и учти его в ответе)`
-                : 'Посмотри на это изображение и учти его в ответе. Если это книга, скажи мне, что ты о ней думаешь. Если это книжная полка, проанализируй вкусы владельца.';
         }
         
         return {
             model: textModel,
-            // @ts-ignore
             history: chatHistory.slice(0, -1),
-            contents: currentUserContent,
+            contents: currentUserContent.parts,
             config: { systemInstruction }
         };
     }
 
-    // New logic for conversational questionnaire
-    if (step !== 'consult' && step !== 'dialog' && history && history.length > 0) {
-        const formattedHistory = history.map(m => `${m.sender === 'user' ? 'Пользователь' : 'Сомелье'}: ${m.text}`).join('\n');
+    if (step === 'init' && history) {
         const promptText = `Это история нашего диалога:\n---\n${formattedHistory}\n---\n
 Твоя задача — проанализировать диалог и решить, что делать дальше.
 1. Кратко и эмпатично отреагируй на последний ответ пользователя.
-2. Определи, какой ключевой информации для подбора книг еще не хватает (из списка: сюжет, жанры, любимые авторы/книги, особые пожелания).
+2. Определи, какой ключевой информации для подбора книг еще не хватает (из списка: сюжет, жанры, любимые авторы/книги).
 3. Задай следующий наиболее логичный вопрос, чтобы получить недостающую информацию.
 4. Если ты считаешь, что информации о настроении, сюжете и жанрах уже достаточно, чтобы дать хорошую рекомендацию, то вместо следующего вопроса ВЕРНИ ТОЛЬКО КОМАНДУ: [PROCEED_TO_CONSULTATION]`;
         
         return {
             model: textModel,
             contents: promptText,
-            config: { systemInstruction }
+            config: { 
+                systemInstruction,
+                thinkingConfig: { thinkingBudget: 0 } // Ускоряем ответы на простых шагах
+            }
         };
     }
     
-    // Fallback for any other case
-    return { model: textModel, contents: '', config: { systemInstruction } };
+    // Fallback
+    return { model: textModel, contents: 'Привет!', config: { systemInstruction } };
 };
 
-
-export const getSommelierResponse = async (step: Step, answers: UserAnswers, history?: ChatMessage[], imageBase64?: string | null): Promise<string> => {
-    const promptConfig = constructPrompt(step, answers, history, imageBase64);
+export const getSommelierResponse = async (step: Step, history?: ChatMessage[], imageBase64?: string | null): Promise<string> => {
+    const promptConfig = constructPrompt(step, history, imageBase64);
     
-    // For dialog step, use chat history
     if (step === 'dialog' && history) {
         const chat = ai.chats.create({
             model: promptConfig.model,
-            // @ts-ignore
             history: promptConfig.history,
             config: promptConfig.config
         });
-        // FIX: Aligned with the recommended API usage by passing a `{ message: ... }` object.
-        const response = await chat.sendMessage({ message: promptConfig.contents.parts });
+        const response = await chat.sendMessage({ message: promptConfig.contents });
         return response.text || "Не удалось получить ответ.";
     }
 
-    // For ALL other steps (init, q1-q4, consult), use a direct generateContent call.
     if (!promptConfig.contents) {
         return "Произошла внутренняя ошибка в логике чата.";
     }
@@ -143,7 +123,6 @@ export const getSommelierResponse = async (step: Step, answers: UserAnswers, his
     });
     return response.text || "Не удалось получить ответ.";
 };
-
 
 export const generateImage = async (prompt: string): Promise<string | null> => {
     try {
@@ -183,6 +162,21 @@ export const generateSpeech = async (text: string): Promise<string | null> => {
     } catch (error) {
         console.error("TTS generation failed:", error);
         return null;
+    }
+};
+
+export const findBookLink = async (title: string, author: string): Promise<string> => {
+    try {
+        const prompt = `Найди самую подходящую веб-ссылку на книгу "${title}" (${author}) на популярном ресурсе (Goodreads, Litres, Amazon и т.п.). Верни ответ только в формате Markdown: [${title}]({ссылка}). Если не можешь найти, напиши "К сожалению, не удалось найти ссылку."`;
+        const response = await ai.models.generateContent({
+            model: textModel,
+            contents: prompt,
+            config: { temperature: 0 }
+        });
+        return response.text || "К сожалению, не удалось найти ссылку.";
+    } catch (error) {
+        console.error("Book link search failed:", error);
+        return "Произошла ошибка при поиске ссылки.";
     }
 };
 
