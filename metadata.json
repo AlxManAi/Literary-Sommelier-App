@@ -1,0 +1,8 @@
+
+{
+  "name": "Literary Sommelier",
+  "description": "An expert AI that recommends the perfect book based on your mood and preferences, featuring voice and image interaction.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
